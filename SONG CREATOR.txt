@@ -1,0 +1,596 @@
+import os
+import uuid
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+import pdfplumber
+from music21 import converter, midi
+import subprocess
+import tempfile
+
+import stripe
+import openai
+import requests
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, DateTime, Boolean, Float, ForeignKey, func
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+
+from authlib.integrations.starlette_client import OAuth
+
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # Render PostgreSQL
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+SOUNDFONT_PATH = os.getenv("SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2")
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "super-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "no-reply@example.com")
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://your-frontend-domain.com")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID", "")
+MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET", "")
+
+stripe.api_key = STRIPE_SECRET_KEY
+openai.api_key = OPENAI_API_KEY
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# -------------------------------------------------------------------
+# DB SETUP
+# -------------------------------------------------------------------
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password = Column(String)
+    is_verified = Column(Boolean, default=False)
+    role = Column(String, default="user")
+
+    subscription_status = Column(String, default="inactive")
+    stripe_customer_id = Column(String)
+    stripe_subscription_id = Column(String)
+
+
+class EmailVerificationToken(Base):
+    __tablename__ = "email_verification_tokens"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String, index=True)
+    token = Column(String, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String, index=True)
+    token = Column(String, unique=True)
+    expires_at = Column(DateTime)
+
+
+class SongHistory(Base):
+    __tablename__ = "song_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_email = Column(String, ForeignKey("users.email"))
+    title = Column(String)
+    musicxml = Column(Text)
+    audio_path = Column(String)
+    instructions = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+
+class SongAnalytics(Base):
+    __tablename__ = "song_analytics"
+
+    id = Column(Integer, primary_key=True)
+    user_email = Column(String, index=True)
+    song_id = Column(Integer)
+    genre = Column(String)
+    key = Column(String)
+    mood = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    render_time_ms = Column(Integer)
+
+
+class SubscriptionAnalytics(Base):
+    __tablename__ = "subscription_analytics"
+
+    id = Column(Integer, primary_key=True)
+    user_email = Column(String)
+    event_type = Column(String)
+    amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine)
+
+# -------------------------------------------------------------------
+# AUTH HELPERS
+# -------------------------------------------------------------------
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str):
+    try:
+        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+
+
+def require_auth(request: Request, db: SessionLocal = Depends(get_db)):
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(401, "Missing token")
+
+    token = auth.split(" ")[1]
+    payload = decode_token(token)
+    if payload is None:
+        raise HTTPException(401, "Invalid or expired token")
+
+    email = payload.get("sub")
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        raise HTTPException(401, "User not found")
+
+    return email
+
+
+def require_admin(request: Request, db: SessionLocal = Depends(get_db)):
+    email = require_auth(request, db)
+    user = db.query(User).filter_by(email=email).first()
+    if user.role != "admin":
+        raise HTTPException(403, "Admins only")
+    return email
+
+# -------------------------------------------------------------------
+# EMAIL (SendGrid)
+# -------------------------------------------------------------------
+
+def send_email(to_email: str, subject: str, content: str):
+    if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+        return
+    url = "https://api.sendgrid.com/v3/mail/send"
+    data = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": SENDGRID_FROM_EMAIL},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": content}],
+    }
+    headers = {
+        "Authorization": f"Bearer {SENDGRID_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        requests.post(url, json=data, headers=headers, timeout=10)
+    except Exception:
+        pass
+
+# -------------------------------------------------------------------
+# PDF PARSING
+# -------------------------------------------------------------------
+
+def extract_pdf_text(file_obj):
+    with pdfplumber.open(file_obj) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+
+def parse_instructions(text: str) -> dict:
+    sections = {}
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith(":") and len(line) < 40:
+            current = line[:-1]
+            sections[current] = ""
+        elif current:
+            sections[current] += line + "\n"
+    return sections
+
+# -------------------------------------------------------------------
+# MUSIC RENDERING
+# -------------------------------------------------------------------
+
+def musicxml_to_midi_bytes(musicxml: str) -> bytes:
+    score = converter.parseData(musicxml)
+    mf = midi.translate.streamToMidiFile(score)
+    return mf.writestr()
+
+
+def midi_bytes_to_mp3(midi_bytes: bytes) -> str:
+    midi_fd, midi_path = tempfile.mkstemp(suffix=".mid")
+    with os.fdopen(midi_fd, "wb") as f:
+        f.write(midi_bytes)
+
+    mp3_fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(mp3_fd)
+
+    subprocess.run(
+        [
+            "fluidsynth",
+            "-ni",
+            SOUNDFONT_PATH,
+            midi_path,
+            "-F",
+            mp3_path,
+            "-r",
+            "44100",
+        ],
+        check=True,
+    )
+
+    return mp3_path
+
+# -------------------------------------------------------------------
+# OPENAI COMPOSER
+# -------------------------------------------------------------------
+
+def generate_musicxml(instructions: dict) -> str:
+    prompt = f"""
+You are a professional music composer.
+
+Compose a complete song in valid MusicXML format using these specifications:
+
+Title: {instructions.get('Title', '').strip()}
+Genre: {instructions.get('Genre', '').strip()}
+Tempo: {instructions.get('Tempo', '').strip()}
+Key: {instructions.get('Key', '').strip()}
+Mood: {instructions.get('Mood', '').strip()}
+
+Lyrics:
+{instructions.get('Lyrics', '').strip()}
+
+Song Structure:
+{instructions.get('Song Structure', '').strip()}
+
+Requirements:
+- Return ONLY valid MusicXML.
+- Include melody and basic harmony.
+- Align lyrics with the vocal line where appropriate.
+"""
+    resp = openai.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a music composition engine."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content
+
+# -------------------------------------------------------------------
+# STRIPE HELPERS
+# -------------------------------------------------------------------
+
+def log_subscription_event(db, email: str, event_type: str, amount: float = 0.0):
+    entry = SubscriptionAnalytics(
+        user_email=email,
+        event_type=event_type,
+        amount=amount,
+    )
+    db.add(entry)
+    db.commit()
+
+# -------------------------------------------------------------------
+# OAUTH (Google + Microsoft)
+# -------------------------------------------------------------------
+
+oauth = OAuth()
+
+google = oauth.register(
+    name="google",
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+microsoft = oauth.register(
+    name="microsoft",
+    client_id=MICROSOFT_CLIENT_ID,
+    client_secret=MICROSOFT_CLIENT_SECRET,
+    server_metadata_url="https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+# -------------------------------------------------------------------
+# APP
+# -------------------------------------------------------------------
+
+app = FastAPI(title="PDF Song Composer – Render Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------------------------
+# AUTH ROUTES
+# -------------------------------------------------------------------
+
+@app.post("/register")
+def register(email: str, password: str, db: SessionLocal = Depends(get_db)):
+    if db.query(User).filter_by(email=email).first():
+        raise HTTPException(400, "Email already registered")
+
+    user = User(email=email, password=hash_password(password))
+    db.add(user)
+    db.commit()
+
+    token = str(uuid.uuid4())
+    db.add(EmailVerificationToken(email=email, token=token))
+    db.commit()
+
+    verify_link = f"{FRONTEND_URL}/verify?token={token}"
+    send_email(email, "Verify Your Account", f"Click here to verify: {verify_link}")
+
+    return {"message": "User created. Check email to verify."}
+
+
+@app.get("/verify")
+def verify(token: str, db: SessionLocal = Depends(get_db)):
+    entry = db.query(EmailVerificationToken).filter_by(token=token).first()
+    if not entry:
+        raise HTTPException(400, "Invalid token")
+
+    user = db.query(User).filter_by(email=entry.email).first()
+    user.is_verified = True
+
+    db.delete(entry)
+    db.commit()
+
+    return {"message": "Account verified"}
+
+
+@app.post("/login")
+def login(email: str, password: str, db: SessionLocal = Depends(get_db)):
+    user = db.query(User).filter_by(email=email).first()
+    if not user or not verify_password(password, user.password):
+        raise HTTPException(401, "Invalid credentials")
+
+    if not user.is_verified:
+        raise HTTPException(403, "Email not verified")
+
+    token = create_access_token({"sub": user.email})
+    return {"access_token": token}
+
+
+@app.post("/forgot-password")
+def forgot_password(email: str, db: SessionLocal = Depends(get_db)):
+    if not db.query(User).filter_by(email=email).first():
+        raise HTTPException(400, "Email not found")
+
+    token = str(uuid.uuid4())
+    expires = datetime.utcnow() + timedelta(minutes=30)
+
+    db.add(PasswordResetToken(email=email, token=token, expires_at=expires))
+    db.commit()
+
+    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+    send_email(email, "Password Reset", f"Click here to reset: {reset_link}")
+
+    return {"message": "Reset link sent"}
+
+
+@app.post("/reset-password")
+def reset_password(token: str, new_password: str, db: SessionLocal = Depends(get_db)):
+    entry = db.query(PasswordResetToken).filter_by(token=token).first()
+    if not entry or entry.expires_at < datetime.utcnow():
+        raise HTTPException(400, "Invalid or expired token")
+
+    user = db.query(User).filter_by(email=entry.email).first()
+    user.password = hash_password(new_password)
+
+    db.delete(entry)
+    db.commit()
+
+    return {"message": "Password updated"}
+
+# -------------------------------------------------------------------
+# OAUTH ROUTES (Option C: frontend redirect)
+# -------------------------------------------------------------------
+
+@app.get("/login/google")
+async def login_google(request: Request):
+    redirect_uri = f"{request.url.scheme}://{request.url.netloc}/auth/google"
+    return await google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/google")
+async def auth_google(request: Request, db: SessionLocal = Depends(get_db)):
+    token = await google.authorize_access_token(request)
+    user_info = token["userinfo"]
+    email = user_info["email"]
+
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        user = User(email=email, password="", is_verified=True)
+        db.add(user)
+        db.commit()
+
+    jwt_token = create_access_token({"sub": email})
+    return RedirectResponse(f"{FRONTEND_URL}/oauth-success?token={jwt_token}")
+
+
+@app.get("/login/microsoft")
+async def login_microsoft(request: Request):
+    redirect_uri = f"{request.url.scheme}://{request.url.netloc}/auth/microsoft"
+    return await microsoft.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/microsoft")
+async def auth_microsoft(request: Request, db: SessionLocal = Depends(get_db)):
+    token = await microsoft.authorize_access_token(request)
+    user_info = token["userinfo"]
+    email = user_info["email"]
+
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        user = User(email=email, password="", is_verified=True)
+        db.add(user)
+        db.commit()
+
+    jwt_token = create_access_token({"sub": email})
+    return RedirectResponse(f"{FRONTEND_URL}/oauth-success?token={jwt_token}")
+
+# -------------------------------------------------------------------
+# COMPOSE + SONG HISTORY
+# -------------------------------------------------------------------
+
+@app.post("/compose")
+def compose_song(
+    file: UploadFile = File(...),
+    request: Request = None,
+    db: SessionLocal = Depends(get_db),
+):
+    email = require_auth(request, db)
+
+    user = db.query(User).filter_by(email=email).first()
+    if user.subscription_status != "active":
+        raise HTTPException(402, "Subscription required")
+
+    start_time = datetime.utcnow()
+
+    try:
+        text = extract_pdf_text(file.file)
+    except Exception as e:
+        raise HTTPException(400, f"Error reading PDF: {e}")
+
+    instructions = parse_instructions(text)
+    musicxml = generate_musicxml(instructions)
+
+    try:
+        midi_bytes = musicxml_to_midi_bytes(musicxml)
+        mp3_path = midi_bytes_to_mp3(midi_bytes)
+    except Exception as e:
+        raise HTTPException(500, f"Error rendering audio: {e}")
+
+    song = SongHistory(
+        user_email=email,
+        title=instructions.get("Title", "Untitled Song"),
+        musicxml=musicxml,
+        audio_path=mp3_path,
+        instructions=text,
+    )
+    db.add(song)
+    db.commit()
+
+    end_time = datetime.utcnow()
+    render_time_ms = int((end_time - start_time).total_seconds() * 1000)
+
+    analytics = SongAnalytics(
+        user_email=email,
+        song_id=song.id,
+        genre=instructions.get("Genre"),
+        key=instructions.get("Key"),
+        mood=instructions.get("Mood"),
+        render_time_ms=render_time_ms,
+    )
+    db.add(analytics)
+    db.commit()
+
+    return {
+        "song_id": song.id,
+        "musicxml": musicxml,
+        "audio_file_path": mp3_path,
+    }
+
+
+@app.get("/download-audio")
+def download_audio(path: str):
+    return FileResponse(path, media_type="audio/mpeg", filename="song.mp3")
+
+
+@app.get("/songs")
+def get_songs(request: Request, db: SessionLocal = Depends(get_db)):
+    email = require_auth(request, db)
+    songs = db.query(SongHistory).filter_by(user_email=email).order_by(SongHistory.created_at.desc()).all()
+    return songs
+
+
+@app.get("/songs/{song_id}")
+def get_song(song_id: int, request: Request, db: SessionLocal = Depends(get_db)):
+    email = require_auth(request, db)
+    song = db.query(SongHistory).filter_by(id=song_id, user_email=email).first()
+    if not song:
+        raise HTTPException(404, "Song not found")
+    return song
+
+
+@app.delete("/songs/{song_id}")
+def delete_song(song_id: int, request: Request, db: SessionLocal = Depends(get_db)):
+    email = require_auth(request, db)
+    song = db.query(SongHistory).filter_by(id=song_id, user_email=email).first()
+    if not song:
+        raise HTTPException(404, "Song not found")
+
+    db.delete(song)
+    db.commit()
+    return {"message": "Song deleted"}
+
+# -------------------------------------------------------------------
+# STRIPE BILLING
+# -------------------------------------------------------------------
+
+@app.post("/create-checkout-session")
+def create_checkout_session(
+    price_id: str,
+    request:
