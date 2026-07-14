@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pdfplumber
+music21
+python-jose[cryptography]
+passlib[bcrypt]
+sqlalchemy
+stripe
+python-multipart
+openai
+requests
+authlib
+psycopg2-binary
